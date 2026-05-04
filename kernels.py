@@ -194,19 +194,23 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     for i in range(TM4):
         tmp[i] = float32(0.0)
 
+    # precompute indices (speed up trick)
+    global_load_row_A = cuda.blockIdx.y * BM4 + load_row_A
+    global_load_col_B = cuda.blockIdx.x * BN4 + load_col_B
+
     # loop over K dimension in chunks of BK4
     for k in range(0, K, BK4):
         # load of A tile (GMEM) into As by row (SMEM)
-        global_load_row_A = cuda.blockIdx.y * BM4 + load_row_A
-        if global_load_row_A < M and k + load_col_A < K:
-            As[load_row_A, load_col_A] = A[global_load_row_A, k + load_col_A]
+        global_load_col_A = k + load_col_A
+        if global_load_row_A < M and global_load_col_A < K:
+            As[load_row_A, load_col_A] = A[global_load_row_A, global_load_col_A]
         else:
             As[load_row_A, load_col_A] = float32(0.0)
 
         # load of B tile (GMEM) into Bs by column (SMEM)
-        global_load_col_B = cuda.blockIdx.x * BN4 + load_col_B
-        if global_load_col_B < N and k + load_row_B < K:
-            Bs[load_row_B, load_col_B] = B[k + load_row_B, global_load_col_B]
+        global_load_row_B = k + load_row_B
+        if global_load_col_B < N and global_load_row_B < K:
+            Bs[load_row_B, load_col_B] = B[global_load_row_B, global_load_col_B]
         else:
             Bs[load_row_B, load_col_B] = float32(0.0)
 
@@ -222,11 +226,12 @@ def sgemm_1d_tile(A, B, C, M, N, K):
 
         # wait
         cuda.syncthreads()
-    
-    for i in range(TM4):
-        global_row = global_row_start + i
-        if global_row < M and global_col_start < N:
-            C[global_row, global_col_start] = tmp[i]
+
+    if global_col_start < N: # speed up trick
+        for i in range(TM4):
+            global_row = global_row_start + i
+            if global_row < M:
+                C[global_row, global_col_start] = tmp[i]
 
     return
 
@@ -258,8 +263,9 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     tx = cuda.threadIdx.x
 
     # 8 by 8 tile per thread, so the starting row and column index for the block should be,
-    row_start_for_calc = (tx // (BN5 // TN5)) * TM5
-    col_start_for_calc = (tx % (BN5 // TN5)) * TN5
+    tmp_v1 = BM5 // TM5 # 16
+    row_start_for_calc = (tx // tmp_v1) * TM5
+    col_start_for_calc = (tx % tmp_v1) * TN5
     
     global_row_start = cuda.blockIdx.y * BM5 + row_start_for_calc
     global_col_start = cuda.blockIdx.x * BN5 + col_start_for_calc
@@ -277,38 +283,88 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     # loop over K dimension in chunks of BK5
     # before loop, caluclate total number of threads per block and number of loads per thread
     num_threads = (BM5 * BN5) // (TM5 * TN5)
-    load_steps = (BM5 * BK5) // num_threads
+
+    # speed up trick: precompute thread's starting
+    # UNROLL THE LOOP to reduce devision overhead
+    idx0 = tx
+    a_row0 = idx0 // BK5
+    a_col0 = idx0 % BK5
+    b_row0 = idx0 // BN5
+    b_col0 = idx0 % BN5
+    g_a_row0 = cuda.blockIdx.y * BM5 + a_row0
+    g_b_col0 = cuda.blockIdx.x * BN5 + b_col0
+
+    idx1 = idx0 + num_threads
+    a_row1 = idx1 // BK5
+    a_col1 = idx1 % BK5
+    b_row1 = idx1 // BN5
+    b_col1 = idx1 % BN5
+    g_a_row1 = cuda.blockIdx.y * BM5 + a_row1
+    g_b_col1 = cuda.blockIdx.x * BN5 + b_col1
+    g_a_row2 = cuda.blockIdx.y * BM5 + a_row0
+    g_b_col2 = cuda.blockIdx.x * BN5 + b_col0
+
+    idx2 = idx1 + num_threads
+    a_row2 = idx2 // BK5
+    a_col2 = idx2 % BK5
+    b_row2 = idx2 // BN5
+    b_col2 = idx2 % BN5
+    g_a_row2 = cuda.blockIdx.y * BM5 + a_row2
+    g_b_col2 = cuda.blockIdx.x * BN5 + b_col2
+
+    idx3 = idx2 + num_threads
+    a_row3 = idx3 // BK5
+    a_col3 = idx3 % BK5
+    b_row3 = idx3 // BN5
+    b_col3 = idx3 % BN5
+    g_a_row3 = cuda.blockIdx.y * BM5 + a_row3
+    g_b_col3 = cuda.blockIdx.x * BN5 + b_col3
 
     for k in range(0, K, BK5):
-        for step in range(load_steps):
-            # current index
-            idx = step * num_threads + tx
             
-            # load of A tile (GMEM) into As by row
-            load_row_A = idx // BK5
-            load_col_A = idx % BK5
+        # load 1
+        if g_a_row0 < M and k + a_col0 < K:
+            As[a_row0, a_col0] = A[g_a_row0, k + a_col0]
+        else:
+            As[a_row0, a_col0] = float32(0.0)
 
-            # load of B tile (GMEM) into Bs by column
-            load_row_B = idx // BN5
-            load_col_B = idx % BN5
+        if g_b_col0 < N and k + b_row0 < K:
+            Bs[b_row0, b_col0] = B[k + b_row0, g_b_col0]
+        else:
+            Bs[b_row0, b_col0] = float32(0.0)
 
-            # global load indices
-            global_load_row_A = cuda.blockIdx.y * BM5 + load_row_A
-            global_load_col_A = k + load_col_A
+        # load 2
+        if g_a_row1 < M and k + a_col1 < K:
+            As[a_row1, a_col1] = A[g_a_row1, k + a_col1]
+        else:
+            As[a_row1, a_col1] = float32(0.0)
 
-            global_load_row_B = k + load_row_B
-            global_load_col_B = cuda.blockIdx.x * BN5 + load_col_B
-            
-            # load
-            if global_load_row_A < M and global_load_col_A < K:
-                As[load_row_A, load_col_A] = A[global_load_row_A, global_load_col_A]
-            else:
-                As[load_row_A, load_col_A] = float32(0.0)
+        if g_b_col1 < N and k + b_row1 < K:
+            Bs[b_row1, b_col1] = B[k + b_row1, g_b_col1]
+        else:
+            Bs[b_row1, b_col1] = float32(0.0)
 
-            if global_load_col_B < N and global_load_row_B < K:
-                Bs[load_row_B, load_col_B] = B[global_load_row_B, global_load_col_B]
-            else:
-                Bs[load_row_B, load_col_B] = float32(0.0)
+        # load 3
+        if g_a_row2 < M and k + a_col2 < K:
+            As[a_row2, a_col2] = A[g_a_row2, k + a_col2]
+        else:
+            As[a_row2, a_col2] = float32(0.0)
+        
+        if g_b_col2 < N and k + b_row2 < K:
+            Bs[b_row2, b_col2] = B[k + b_row2, g_b_col2]
+        else:
+            Bs[b_row2, b_col2] = float32(0.0)
+        
+        # load 4
+        if g_a_row3 < M and k + a_col3 < K:
+            As[a_row3, a_col3] = A[g_a_row3, k + a_col3]
+        else:
+            As[a_row3, a_col3] = float32(0.0)
+
+        if g_b_col3 < N and k + b_row3 < K:
+            Bs[b_row3, b_col3] = B[k + b_row3, g_b_col3]
+        else:
+            Bs[b_row3, b_col3] = float32(0.0)
 
         # wait
         cuda.syncthreads()
@@ -330,11 +386,12 @@ def sgemm_2d_tile(A, B, C, M, N, K):
         cuda.syncthreads()
     
     for i in range(TM5):
-        for j in range(TN5):
-            global_row = global_row_start + i
-            global_col = global_col_start + j
-            if global_row < M and global_col < N:
-                C[global_row, global_col] = tmp[i, j]
+        global_row = global_row_start + i
+        if global_row < M:
+            for j in range(TN5):
+                global_col = global_col_start + j
+                if global_col < N:
+                    C[global_row, global_col] = tmp[i, j]
 
     return
 
