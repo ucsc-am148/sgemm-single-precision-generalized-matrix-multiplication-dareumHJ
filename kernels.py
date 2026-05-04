@@ -261,15 +261,22 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     Bs = cuda.shared.array((BK5, BN5), float32)
 
     tx = cuda.threadIdx.x
+    bx = cuda.blockIdx.x
+    by = cuda.blockIdx.y
 
     # 8 by 8 tile per thread, so the starting row and column index for the block should be,
-    tmp_v1 = BM5 // TM5 # 16
-    row_start_for_calc = (tx // tmp_v1) * TM5
-    col_start_for_calc = (tx % tmp_v1) * TN5
-    
-    global_row_start = cuda.blockIdx.y * BM5 + row_start_for_calc
-    global_col_start = cuda.blockIdx.x * BN5 + col_start_for_calc
-    
+    threads_per_row = BN5 // TN5 # 16
+    thread_row = tx // threads_per_row
+    thread_col = tx % threads_per_row
+
+    inner_row_a = tx // BK5 # row index for loading A
+    inner_col_a = tx % BK5 # column index for loading A
+    stride_a = ((BM5 * BN5) // (TM5 * TN5)) // BK5 # 32
+
+    inner_row_b = tx // BN5 # row index for loading B
+    inner_col_b = tx % BN5 # column index for loading B
+    stride_b = ((BM5 * BN5) // (TM5 * TN5)) // BN5 # 16
+
     tmp = cuda.local.array((TM5, TN5), float32)
     for i in range(TM5):
         for j in range(TN5):
@@ -277,105 +284,41 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
     # cache As and Bs values for the current K-chunk into registers to reuse
     # (speed up)
-    reg_a = cuda.local.array(TM5, float32)
-    reg_b = cuda.local.array(TN5, float32)
-
-    # loop over K dimension in chunks of BK5
-    # before loop, caluclate total number of threads per block and number of loads per thread
-    num_threads = (BM5 * BN5) // (TM5 * TN5)
-
-    # speed up trick: precompute thread's starting
-    # UNROLL THE LOOP to reduce devision overhead
-    idx0 = tx
-    a_row0 = idx0 // BK5
-    a_col0 = idx0 % BK5
-    b_row0 = idx0 // BN5
-    b_col0 = idx0 % BN5
-    g_a_row0 = cuda.blockIdx.y * BM5 + a_row0
-    g_b_col0 = cuda.blockIdx.x * BN5 + b_col0
-
-    idx1 = idx0 + num_threads
-    a_row1 = idx1 // BK5
-    a_col1 = idx1 % BK5
-    b_row1 = idx1 // BN5
-    b_col1 = idx1 % BN5
-    g_a_row1 = cuda.blockIdx.y * BM5 + a_row1
-    g_b_col1 = cuda.blockIdx.x * BN5 + b_col1
-    g_a_row2 = cuda.blockIdx.y * BM5 + a_row0
-    g_b_col2 = cuda.blockIdx.x * BN5 + b_col0
-
-    idx2 = idx1 + num_threads
-    a_row2 = idx2 // BK5
-    a_col2 = idx2 % BK5
-    b_row2 = idx2 // BN5
-    b_col2 = idx2 % BN5
-    g_a_row2 = cuda.blockIdx.y * BM5 + a_row2
-    g_b_col2 = cuda.blockIdx.x * BN5 + b_col2
-
-    idx3 = idx2 + num_threads
-    a_row3 = idx3 // BK5
-    a_col3 = idx3 % BK5
-    b_row3 = idx3 // BN5
-    b_col3 = idx3 % BN5
-    g_a_row3 = cuda.blockIdx.y * BM5 + a_row3
-    g_b_col3 = cuda.blockIdx.x * BN5 + b_col3
+    reg_a = cuda.local.array((TM5,), float32)
+    reg_b = cuda.local.array((TN5,), float32)
 
     for k in range(0, K, BK5):
-            
-        # load 1
-        if g_a_row0 < M and k + a_col0 < K:
-            As[a_row0, a_col0] = A[g_a_row0, k + a_col0]
-        else:
-            As[a_row0, a_col0] = float32(0.0)
 
-        if g_b_col0 < N and k + b_row0 < K:
-            Bs[b_row0, b_col0] = B[k + b_row0, g_b_col0]
-        else:
-            Bs[b_row0, b_col0] = float32(0.0)
-
-        # load 2
-        if g_a_row1 < M and k + a_col1 < K:
-            As[a_row1, a_col1] = A[g_a_row1, k + a_col1]
-        else:
-            As[a_row1, a_col1] = float32(0.0)
-
-        if g_b_col1 < N and k + b_row1 < K:
-            Bs[b_row1, b_col1] = B[k + b_row1, g_b_col1]
-        else:
-            Bs[b_row1, b_col1] = float32(0.0)
-
-        # load 3
-        if g_a_row2 < M and k + a_col2 < K:
-            As[a_row2, a_col2] = A[g_a_row2, k + a_col2]
-        else:
-            As[a_row2, a_col2] = float32(0.0)
+        for step in range(0, BM5, stride_a):
+            load_row_A = inner_row_a + step
+            global_row_A = by * BM5 + load_row_A
+            global_col_A = k + inner_col_a
+            if global_row_A < M and global_col_A < K:
+                As[load_row_A, inner_col_a] = A[global_row_A, global_col_A]
+            else:
+                As[load_row_A, inner_col_a] = float32(0.0)
         
-        if g_b_col2 < N and k + b_row2 < K:
-            Bs[b_row2, b_col2] = B[k + b_row2, g_b_col2]
-        else:
-            Bs[b_row2, b_col2] = float32(0.0)
-        
-        # load 4
-        if g_a_row3 < M and k + a_col3 < K:
-            As[a_row3, a_col3] = A[g_a_row3, k + a_col3]
-        else:
-            As[a_row3, a_col3] = float32(0.0)
-
-        if g_b_col3 < N and k + b_row3 < K:
-            Bs[b_row3, b_col3] = B[k + b_row3, g_b_col3]
-        else:
-            Bs[b_row3, b_col3] = float32(0.0)
+        for step in range(0, BK5, stride_b):
+            load_row_B = inner_row_b + step
+            global_row_B = k + load_row_B
+            global_col_B = bx * BN5 + inner_col_b
+            if global_row_B < K and global_col_B < N:
+                Bs[load_row_B, inner_col_b] = B[global_row_B, global_col_B]
+            else:
+                Bs[load_row_B, inner_col_b] = float32(0.0)
 
         # wait
         cuda.syncthreads()
 
-        # compute dot product
+        # compute outer product
+        tmp_v1 = thread_row * TM5
+        tmp_v2 = thread_col * TN5
         for i in range(BK5):
             # load TM5 values from As, Bs into each register array
             for j in range(TM5):
-                reg_a[j] = As[row_start_for_calc + j, i]
+                reg_a[j] = As[tmp_v1 + j, i]
             for j in range(TN5):
-                reg_b[j] = Bs[i, col_start_for_calc + j]
+                reg_b[j] = Bs[i, tmp_v2 + j]
 
             # outer product update of the (TM5, TN5) register tile
             for y in range(TM5):
@@ -385,11 +328,13 @@ def sgemm_2d_tile(A, B, C, M, N, K):
         # wait
         cuda.syncthreads()
     
+    write_row_C = by * BM5 + thread_row * TM5
+    write_col_C = bx * BN5 + thread_col * TN5
     for i in range(TM5):
-        global_row = global_row_start + i
+        global_row = write_row_C + i
         if global_row < M:
             for j in range(TN5):
-                global_col = global_col_start + j
+                global_col = write_col_C + j
                 if global_col < N:
                     C[global_row, global_col] = tmp[i, j]
 

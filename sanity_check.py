@@ -36,6 +36,7 @@ SIZES = [
     (256, 256, 256),    # square baseline
     (768, 256, 512),    # M > N: catches blockIdx.x/y axis confusion bugs
     (256, 768, 512),    # N > M: mirror — same class of bug, opposite direction
+    (2048, 2048, 2048),
 ]
 TOL = 1e-2   # max abs error tolerance (lenient — fp32 roundoff at this size)
 
